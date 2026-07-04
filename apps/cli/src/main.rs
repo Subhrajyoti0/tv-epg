@@ -1,3 +1,5 @@
+mod xmltv_mapper;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -18,12 +20,13 @@ use omega_providers::{JioProvider, Zee5Provider};
 use omega_playlist::{build_indexes, build_m3u, Playlist, PlaylistEntry};
 use omega_database::repositories::programme_repository::ProgrammeRepository;
 use omega_providers::jio::epg::fetch_jio_epg_for_channel;
+use omega_providers::zee5::epg::fetch_zee5_epg_for_channel;
+use xmltv_mapper::build_xmltv_from_iptv_tvg_ids;
+
 use omega_xmltv::{
     build_xmltv_string,
     write_gzip_file,
     write_xmltv_file,
-    XmltvChannel,
-    XmltvProgramme,
 };
 
 #[derive(Debug, Parser)]
@@ -147,6 +150,14 @@ enum EpgCommand {
 
         #[arg(long, default_value_t = 1)]
         end_offset: i32,
+
+        #[arg(long, default_value_t = false)]
+        persist: bool,
+    },
+
+    Zee5 {
+        #[arg(long)]
+        limit: Option<usize>,
 
         #[arg(long, default_value_t = false)]
         persist: bool,
@@ -329,6 +340,16 @@ async fn main() -> anyhow::Result<()> {
                     limit,
                     start_offset,
                     end_offset,
+                    persist,
+                )
+                .await?;
+            }
+
+            EpgCommand::Zee5 { limit, persist } => {
+                run_zee5_epg_pipeline(
+                    client.clone(),
+                    &cli.database_url,
+                    limit,
                     persist,
                 )
                 .await?;
@@ -757,29 +778,36 @@ async fn run_xmltv_pipeline(database_url: &str) -> anyhow::Result<()> {
     let pool = connect_and_migrate(database_url).await?;
 
     let export_repo = ExportRepository::new(pool.clone());
-    let programme_repo = ProgrammeRepository::new(pool);
+    let programme_repo = ProgrammeRepository::new(pool.clone());
+    let provider_repo = ProviderChannelRepository::new(pool);
 
-    let channel_rows = export_repo.xmltv_channels_json().await?;
     let map_rows = export_repo.programme_channel_map_json().await?;
     let programmes = programme_repo.list_all().await?;
 
-    println!("📺 XMLTV channels available : {}", channel_rows.len());
-    println!("🧾 Programme rows available : {}", programmes.len());
-    println!("🔗 Channel map rows         : {}", map_rows.len());
+    let iptv_channels = provider_repo.list_by_provider("iptv_org").await?;
+    let jio_channels = provider_repo.list_by_provider("jio").await?;
+    let zee5_channels = provider_repo.list_by_provider("zee5").await?;
 
-    if channel_rows.is_empty() {
-        println!("⚠️ No unified channels found. Run:");
-        println!("cargo run -p omega-cli -- match");
+    println!("📺 IPTV-org tvg-id channels : {}", iptv_channels.len());
+    println!("📺 Jio source channels      : {}", jio_channels.len());
+    println!("📺 Zee5 source channels     : {}", zee5_channels.len());
+    println!("🧾 Programme rows available : {}", programmes.len());
+    println!("🔗 Direct Jio map rows      : {}", map_rows.len());
+
+    if iptv_channels.is_empty() {
+        println!("⚠️ No IPTV-org channels found. Run:");
+        println!("cargo run -p omega-cli -- parse iptv-org --input in.m3u --persist");
         return Ok(());
     }
 
     if programmes.is_empty() {
         println!("⚠️ No programmes found. Run:");
         println!("cargo run -p omega-cli -- epg jio --limit 20 --persist");
+        println!("cargo run -p omega-cli -- epg zee5 --limit 20 --persist");
         return Ok(());
     }
 
-    let mut channel_map: HashMap<String, String> = HashMap::new();
+    let mut jio_direct_map: HashMap<String, String> = HashMap::new();
 
     for row in map_rows {
         let Some(source_channel_id) = json_string(&row, "source_channel_id") else {
@@ -790,54 +818,35 @@ async fn run_xmltv_pipeline(database_url: &str) -> anyhow::Result<()> {
             continue;
         };
 
-        channel_map.insert(source_channel_id, tvg_id);
+        jio_direct_map.insert(source_channel_id, tvg_id);
     }
 
-    let mut xml_channels = Vec::new();
+    let mapped = build_xmltv_from_iptv_tvg_ids(
+        &iptv_channels,
+        &jio_channels,
+        &zee5_channels,
+        &programmes,
+        &jio_direct_map,
+    );
 
-    for row in channel_rows {
-        let Some(tvg_id) = json_string(&row, "tvg_id") else {
-            continue;
-        };
-
-        let name = json_string(&row, "display_name")
-            .unwrap_or_else(|| tvg_id.clone());
-
-        let mut channel = XmltvChannel::new(tvg_id, name);
-        channel.icon = json_string(&row, "logo");
-
-        xml_channels.push(channel);
-    }
-
-    let mut xml_programmes = Vec::new();
-
-    for programme in programmes {
-        let Some(tvg_id) = channel_map.get(&programme.channel_id) else {
-            continue;
-        };
-
-        let mut xml_programme = XmltvProgramme::from(&programme);
-        xml_programme.channel_id = tvg_id.clone();
-
-        xml_programmes.push(xml_programme);
-    }
-
-    println!("📺 XMLTV channels written    : {}", xml_channels.len());
-    println!("🧾 XMLTV programmes written  : {}", xml_programmes.len());
+    println!("🔗 Jio channel map rows      : {}", mapped.jio_map_count);
+    println!("🔗 Zee5 channel map rows     : {}", mapped.zee5_map_count);
+    println!("📺 XMLTV channels written    : {}", mapped.channels.len());
+    println!("🧾 XMLTV programmes written  : {}", mapped.programmes.len());
 
     fs::create_dir_all("output")?;
 
     write_xmltv_file(
         "output/omega.xml",
-        &xml_channels,
-        &xml_programmes,
+        &mapped.channels,
+        &mapped.programmes,
         "omega-iptv-rust",
         330,
     )?;
 
     let xml = build_xmltv_string(
-        &xml_channels,
-        &xml_programmes,
+        &mapped.channels,
+        &mapped.programmes,
         "omega-iptv-rust",
         330,
     )?;
@@ -924,13 +933,22 @@ async fn run_full_build_pipeline(
     if skip_epg {
         println!("⏭️ Step 7: EPG skipped");
     } else {
-        println!("🗓️ Step 7: Fetch Jio EPG");
+        println!("🗓️ Step 7A: Fetch Jio EPG");
         run_jio_epg_pipeline(
             client.clone(),
             database_url,
             epg_limit,
             start_offset,
             end_offset,
+            true,
+        )
+        .await?;
+
+        println!("🗓️ Step 7B: Fetch Zee5 EPG");
+        run_zee5_epg_pipeline(
+            client.clone(),
+            database_url,
+            epg_limit,
             true,
         )
         .await?;
@@ -1169,4 +1187,67 @@ fn sha256_file(path: impl AsRef<Path>) -> anyhow::Result<String> {
     let digest = hasher.finalize();
 
     Ok(format!("{:x}", digest))
+}
+
+async fn run_zee5_epg_pipeline(
+    client: reqwest::Client,
+    database_url: &str,
+    limit: Option<usize>,
+    persist: bool,
+) -> anyhow::Result<()> {
+    println!("🗓️ Starting Zee5 EPG pipeline");
+
+    let pool = connect_and_migrate(database_url).await?;
+    let provider_repo = ProviderChannelRepository::new(pool.clone());
+    let programme_repo = ProgrammeRepository::new(pool);
+
+    let mut channels = provider_repo.list_by_provider("zee5").await?;
+
+    if let Some(limit) = limit {
+        channels.truncate(limit);
+    }
+
+    println!("📺 Zee5 channels selected: {}", channels.len());
+
+    let mut total_programmes = 0usize;
+    let mut saved_programmes = 0usize;
+
+    for (index, channel) in channels.iter().enumerate() {
+        println!(
+            "📡 [{}/{}] Fetching Zee5 EPG: {} ({})",
+            index + 1,
+            channels.len(),
+            channel.name,
+            channel.id
+        );
+
+        match fetch_zee5_epg_for_channel(&client, channel).await {
+            Ok(programmes) => {
+                println!("   ✅ programmes: {}", programmes.len());
+                total_programmes += programmes.len();
+
+                if persist {
+                    for programme in &programmes {
+                        programme_repo.insert_ignore(programme).await?;
+                        saved_programmes += 1;
+                    }
+                }
+            }
+
+            Err(error) => {
+                println!("   ⚠️ failed: {}", error);
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    }
+
+    println!("✅ Zee5 EPG programmes fetched : {}", total_programmes);
+
+    if persist {
+        println!("💾 Zee5 EPG programmes saved   : {}", saved_programmes);
+        println!("✅ Database                    : {}", database_url);
+    }
+
+    Ok(())
 }
