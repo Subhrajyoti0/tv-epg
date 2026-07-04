@@ -1,0 +1,28 @@
+[package]
+name = "omega-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "omega"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+sqlx.workspace = true
+sha2.workspace = true
+
+omega-core = { path = "../../crates/core" }
+omega-providers = { path = "../../crates/providers" }
+omega-matcher = { path = "../../crates/matcher" }
+omega-database = { path = "../../crates/database" }
+omega-playlist = { path = "../../crates/playlist" }
+omega-xmltv = { path = "../../crates/xmltv" }

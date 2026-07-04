@@ -1,0 +1,100 @@
+name: Omega IPTV Rust Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: omega-iptv-rust-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build-test-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3 pkg-config libssl-dev curl
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Download IPTV-org India M3U
+        run: |
+          curl -L -o in.m3u https://raw.githubusercontent.com/iptv-org/iptv/refs/heads/master/streams/in.m3u
+          ls -lh in.m3u
+          head -n 5 in.m3u
+
+      - name: Cargo check
+        run: |
+          CARGO_BUILD_JOBS=1 cargo check
+
+      - name: Cargo test
+        run: |
+          CARGO_BUILD_JOBS=1 cargo test
+
+      - name: Run Omega build
+        run: |
+          CARGO_BUILD_JOBS=1 cargo run -p omega-cli -- build --epg-limit 20 --start-offset 0 --end-offset 1
+
+      - name: Verify output files
+        run: |
+          ls -lh output
+          ls -lh output/public
+          test -s output/public/omega.m3u
+          test -s output/public/omega.xml
+          test -s output/public/omega.xml.gz
+          test -s output/public/manifest.json
+
+      - name: Validate XML is real XML
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          text = Path("output/public/omega.xml").read_text()
+
+          lt = chr(60)
+          amp = chr(38)
+
+          assert text.startswith(lt + "?xml"), "omega.xml does not start with real XML declaration"
+          assert not text.startswith(amp + "lt;?xml"), "omega.xml starts with escaped XML"
+          assert text.count(lt + "programme") > 0, "omega.xml contains no real programme tags"
+          assert text.count(amp + "lt;programme") == 0, "omega.xml contains escaped programme tags"
+
+          print("XML validation OK")
+          print("programme count:", text.count(lt + "programme"))
+          PY
+
+      - name: Upload build output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: omega-output
+          path: output/
+
+      - name: Upload GitHub Pages artifact
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: output/public
+
+      - name: Deploy to GitHub Pages
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/deploy-pages@v4

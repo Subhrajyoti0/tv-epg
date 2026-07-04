@@ -1,0 +1,36 @@
+# Rust build output
+target/
+
+# Omega runtime database
+omega.db
+*.db
+*.sqlite
+*.sqlite3
+
+# Generate* output artifacts
+output/
+logs/
+tm*/
+cache/
+
+# Downloaded IPTV source*in.m3u
+
+# Environment files
+.env
+.*nv.local
+.env.production
+
+# OS/edi*or files
+.DS_Store
+*humb*.db
+*.log
+
+.idea/
+.vscode/
+
+# Swap*/ temp files
+*.swp
+*.swo
+
+# Downloaded IPTV source
+in.m3u

@@ -1,0 +1,23 @@
+pub mod channel;
+pub mod circuit_breaker;
+pub mod config;
+pub mod error;
+pub mod http;
+pub mod match_result;
+pub mod programme;
+pub mod provider;
+pub mod provider_trait;
+pub mod rate_limiter;
+pub mod retry;
+pub mod review;
+pub mod unified_channel;
+
+pub use channel::Channel;
+pub use config::OmegaConfig;
+pub use error::{OmegaError, OmegaResult};
+pub use match_result::{Confidence, MatchDecision, MatchResult};
+pub use programme::Programme;
+pub use provider::{ProviderInfo, ProviderKind};
+pub use provider_trait::Provider;
+pub use review::ReviewItem;
+pub use unified_channel::{ProviderReference, UnifiedChannel};

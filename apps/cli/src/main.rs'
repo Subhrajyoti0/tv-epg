@@ -1,0 +1,332 @@
+use std::fs;
+
+use clap::{Parser, Subcommand};
+use omega_core::http::HttpClientFactory;
+use omega_core::Provider;
+use omega_database::repositories::provider_channel_repository::ProviderChannelRepository;
+use omega_database::repositories::channel_repository::ChannelRepository;
+use omega_database::repositories::match_repository::MatchRepository;
+use omega_database::repositories::review_repository::ReviewRepository;
+use omega_matcher::{AliasEngine, create_review_item, resolve_channel_match};
+use omega_database::{connect, migrate};
+use omega_providers::iptv_org::parse_iptv_org_m3u;
+use omega_providers::{JioProvider, Zee5Provider};
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "omega",
+    version,
+    about = "Omega IPTV Rust Platform",
+    long_about = "Ultra-performance IPTV, XMLTV, playlist, matching, and provider orchestration platform."
+)]
+struct Cli {
+    #[arg(long, default_value = "sqlite://omega.db")]
+    database_url: String,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Run the complete production build pipeline
+    Build {
+        #[arg(long, default_value_t = true)]
+        persist: bool,
+    },
+
+    /// Fetch provider data
+    Fetch {
+        #[command(subcommand)]
+        provider: FetchCommand,
+    },
+
+    /// Parse source files such as IPTV-org M3U
+    Parse {
+        #[command(subcommand)]
+        source: ParseCommand,
+    },
+
+    /// Run unified channel matcher
+    Match,
+
+    /// Generate XMLTV files
+    Xmltv,
+
+    /// Generate playlists and indexes
+    Playlist,
+
+    /// Run system health checks
+    Doctor,
+}
+
+#[derive(Debug, Subcommand)]
+enum FetchCommand {
+    Zee5 {
+        #[arg(long, default_value_t = false)]
+        persist: bool,
+    },
+    Jio {
+        #[arg(long, default_value_t = false)]
+        persist: bool,
+    },
+    All {
+        #[arg(long, default_value_t = false)]
+        persist: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ParseCommand {
+    IptvOrg {
+        #[arg(long, default_value = "in.m3u")]
+        input: String,
+
+        #[arg(long, default_value_t = false)]
+        persist: bool,
+    },
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    let http = HttpClientFactory::new(
+        30,
+        "Mozilla/5.0 Omega-IPTV-Rust/1.0",
+    );
+
+    let client = http.build()?;
+
+    match cli.command {
+        Commands::Build { persist } => {
+            println!("🚀 omega build: starting foundation pipeline");
+
+            let zee5 = Zee5Provider::new(client.clone());
+            let jio = JioProvider::new(client.clone());
+
+            let db_repo = if persist {
+                let pool = connect_and_migrate(&cli.database_url).await?;
+                Some(ProviderChannelRepository::new(pool))
+            } else {
+                None
+            };
+
+            let mut all_saved = 0usize;
+
+            println!("📺 Fetching Zee5 channels...");
+            let zee5_channels = zee5.fetch_channels().await?;
+            println!("✅ Zee5 channels fetched: {}", zee5_channels.len());
+
+            if let Some(repo) = &db_repo {
+                let saved = persist_channels(repo, &zee5_channels).await?;
+                all_saved += saved;
+                println!("💾 Zee5 channels saved: {}", saved);
+            }
+
+            println!("📺 Fetching Jio channels...");
+            let jio_channels = jio.fetch_channels().await?;
+            println!("✅ Jio channels fetched: {}", jio_channels.len());
+
+            if let Some(repo) = &db_repo {
+                let saved = persist_channels(repo, &jio_channels).await?;
+                all_saved += saved;
+                println!("💾 Jio channels saved: {}", saved);
+            }
+
+            if persist {
+                println!("✅ Total provider channels saved: {}", all_saved);
+                println!("✅ Database: {}", cli.database_url);
+            }
+
+            println!("✅ Build foundation step complete");
+        }
+
+        Commands::Fetch { provider } => match provider {
+            FetchCommand::Zee5 { persist } => {
+                let provider = Zee5Provider::new(client.clone());
+
+                println!("📡 Checking Zee5 provider health...");
+                let healthy = provider.health_check().await?;
+                println!("Zee5 health: {}", healthy);
+
+                println!("📺 Fetching Zee5 channels...");
+                let channels = provider.fetch_channels().await?;
+                println!("✅ Zee5 channels fetched: {}", channels.len());
+
+                for channel in channels.iter().take(10) {
+                    println!(" - {} ({})", channel.name, channel.id);
+                }
+
+                if persist {
+                    let pool = connect_and_migrate(&cli.database_url).await?;
+                    let repo = ProviderChannelRepository::new(pool);
+                    let saved = persist_channels(&repo, &channels).await?;
+
+                    println!("💾 Zee5 channels saved: {}", saved);
+                    println!("✅ Database: {}", cli.database_url);
+                }
+            }
+
+            FetchCommand::Jio { persist } => {
+                let provider = JioProvider::new(client.clone());
+
+                println!("📡 Checking Jio provider health...");
+                let healthy = provider.health_check().await?;
+                println!("Jio health: {}", healthy);
+
+                println!("📺 Fetching Jio channels...");
+                let channels = provider.fetch_channels().await?;
+                println!("✅ Jio channels fetched: {}", channels.len());
+
+                for channel in channels.iter().take(10) {
+                    println!(" - {} ({})", channel.name, channel.id);
+                }
+
+                if persist {
+                    let pool = connect_and_migrate(&cli.database_url).await?;
+                    let repo = ProviderChannelRepository::new(pool);
+                    let saved = persist_channels(&repo, &channels).await?;
+
+                    println!("💾 Jio channels saved: {}", saved);
+                    println!("✅ Database: {}", cli.database_url);
+                }
+            }
+
+            FetchCommand::All { persist } => {
+                let zee5 = Zee5Provider::new(client.clone());
+                let jio = JioProvider::new(client.clone());
+
+                println!("📡 Checking providers...");
+
+                let zee5_health = zee5.health_check().await.unwrap_or(false);
+                let jio_health = jio.health_check().await.unwrap_or(false);
+
+                println!("Zee5 health: {}", zee5_health);
+                println!("Jio health : {}", jio_health);
+
+                let db_repo = if persist {
+                    let pool = connect_and_migrate(&cli.database_url).await?;
+                    Some(ProviderChannelRepository::new(pool))
+                } else {
+                    None
+                };
+
+                let mut total_saved = 0usize;
+
+                if zee5_health {
+                    println!("📺 Fetching Zee5 channels...");
+                    let channels = zee5.fetch_channels().await?;
+                    println!("✅ Zee5 channels fetched: {}", channels.len());
+
+                    if let Some(repo) = &db_repo {
+                        let saved = persist_channels(repo, &channels).await?;
+                        total_saved += saved;
+                        println!("💾 Zee5 channels saved: {}", saved);
+                    }
+                }
+
+                if jio_health {
+                    println!("📺 Fetching Jio channels...");
+                    let channels = jio.fetch_channels().await?;
+                    println!("✅ Jio channels fetched: {}", channels.len());
+
+                    if let Some(repo) = &db_repo {
+                        let saved = persist_channels(repo, &channels).await?;
+                        total_saved += saved;
+                        println!("💾 Jio channels saved: {}", saved);
+                    }
+                }
+
+                if persist {
+                    println!("✅ Total provider channels saved: {}", total_saved);
+                    println!("✅ Database: {}", cli.database_url);
+                }
+            }
+        },
+
+        Commands::Parse { source } => match source {
+            ParseCommand::IptvOrg { input, persist } => {
+                println!("📄 Parsing IPTV-org M3U");
+                println!("Input: {}", input);
+
+                let content = fs::read_to_string(&input)?;
+                let channels = parse_iptv_org_m3u(&content)?;
+
+                println!("✅ IPTV-org channels parsed: {}", channels.len());
+
+                for channel in channels.iter().take(10) {
+                    println!(" - {} ({})", channel.name, channel.id);
+                }
+
+                if persist {
+                    let pool = connect_and_migrate(&cli.database_url).await?;
+                    let repo = ProviderChannelRepository::new(pool);
+                    let saved = persist_channels(&repo, &channels).await?;
+
+                    println!("💾 IPTV-org channels saved: {}", saved);
+                    println!("✅ Database: {}", cli.database_url);
+                }
+            }
+        },
+
+        Commands::Match => {
+            run_match_pipeline(&cli.database_url).await?;
+	}
+
+        Commands::Xmltv => {
+            println!("🗓️ omega xmltv: XMLTV engine ready, pipeline wiring comes later");
+        }
+
+        Commands::Playlist => {
+            println!("📺 omega playlist: playlist engine ready, index builder ready");
+        }
+
+        Commands::Doctor => {
+            println!("🩺 omega doctor: workspace OK");
+
+            let zee5 = Zee5Provider::new(client.clone());
+            let jio = JioProvider::new(client.clone());
+
+            let zee5_health = zee5.health_check().await.unwrap_or(false);
+            let jio_health = jio.health_check().await.unwrap_or(false);
+
+            println!("Zee5 provider: {}", if zee5_health { "OK" } else { "FAILED" });
+            println!("Jio provider : {}", if jio_health { "OK" } else { "FAILED" });
+
+            let pool = connect_and_migrate(&cli.database_url).await?;
+            let repo = ProviderChannelRepository::new(pool);
+
+            let zee5_count = repo.count_by_provider("zee5").await.unwrap_or(0);
+            let jio_count = repo.count_by_provider("jio").await.unwrap_or(0);
+            let iptv_count = repo.count_by_provider("iptv_org").await.unwrap_or(0);
+
+            println!("Database      : OK");
+            println!("DB Zee5 count : {}", zee5_count);
+            println!("DB Jio count  : {}", jio_count);
+            println!("DB IPTV count : {}", iptv_count);
+        }
+    }
+
+    Ok(())
+}
+
+async fn connect_and_migrate(database_url: &str) -> anyhow::Result<omega_database::DbPool> {
+    let pool = connect(database_url).await?;
+    migrate(&pool).await?;
+    Ok(pool)
+}
+
+async fn persist_channels(
+    repo: &ProviderChannelRepository,
+    channels: &[omega_core::Channel],
+) -> anyhow::Result<usize> {
+    let mut saved = 0usize;
+
+    for channel in channels {
+        repo.upsert(channel).await?;
+        saved += 1;
+    }
+
+    Ok(saved)
+}

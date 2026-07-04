@@ -1,0 +1,44 @@
+name: Omega Release Binary
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-binary:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3 pkg-config libssl-dev curl
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: |
+          CARGO_BUILD_JOBS=1 cargo build -p omega-cli --release
+
+      - name: Prepare binary artifact
+        run: |
+          mkdir -p release
+          cp target/release/omega release/omega-linux-x86_64
+          chmod +x release/omega-linux-x86_64
+          sha256sum release/omega-linux-x86_64 > release/omega-linux-x86_64.sha256
+          ls -lh release
+
+      - name: Upload release binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: omega-linux-x86_64
+          path: release/
