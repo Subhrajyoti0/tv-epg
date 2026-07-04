@@ -139,6 +139,13 @@ enum ExportCommand {
     All,
 }
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum ClearMode {
+    Provider,
+    All,
+    None,
+}
+
 #[derive(Debug, Subcommand)]
 enum EpgCommand {
     Jio {
@@ -153,6 +160,9 @@ enum EpgCommand {
 
         #[arg(long, default_value_t = false)]
         persist: bool,
+
+        #[arg(long, value_enum, default_value_t = ClearMode::Provider)]
+        clear_mode: ClearMode,
     },
 
     Zee5 {
@@ -161,6 +171,9 @@ enum EpgCommand {
 
         #[arg(long, default_value_t = false)]
         persist: bool,
+
+        #[arg(long, value_enum, default_value_t = ClearMode::Provider)]
+        clear_mode: ClearMode,
     },
 }
 
@@ -333,6 +346,7 @@ async fn main() -> anyhow::Result<()> {
                 start_offset,
                 end_offset,
                 persist,
+                clear_mode,
             } => {
                 run_jio_epg_pipeline(
                     client.clone(),
@@ -341,16 +355,22 @@ async fn main() -> anyhow::Result<()> {
                     start_offset,
                     end_offset,
                     persist,
+                    clear_mode,
                 )
                 .await?;
             }
 
-            EpgCommand::Zee5 { limit, persist } => {
+            EpgCommand::Zee5 {
+                limit,
+                persist,
+                clear_mode,
+            } => {
                 run_zee5_epg_pipeline(
                     client.clone(),
                     &cli.database_url,
                     limit,
                     persist,
+                    clear_mode,
                 )
                 .await?;
             }
@@ -704,6 +724,7 @@ async fn run_jio_epg_pipeline(
     start_offset: i32,
     end_offset: i32,
     persist: bool,
+    clear_mode: ClearMode,
 ) -> anyhow::Result<()> {
     println!("🗓️ Starting Jio EPG pipeline");
     println!("Offset range: {} -> {}", start_offset, end_offset);
@@ -711,6 +732,10 @@ async fn run_jio_epg_pipeline(
     let pool = connect_and_migrate(database_url).await?;
     let provider_repo = ProviderChannelRepository::new(pool.clone());
     let programme_repo = ProgrammeRepository::new(pool);
+
+    if persist {
+        apply_programme_clear_mode(&programme_repo, "jio", clear_mode).await?;
+    }
 
     let mut channels = provider_repo.list_by_provider("jio").await?;
 
@@ -788,10 +813,22 @@ async fn run_xmltv_pipeline(database_url: &str) -> anyhow::Result<()> {
     let jio_channels = provider_repo.list_by_provider("jio").await?;
     let zee5_channels = provider_repo.list_by_provider("zee5").await?;
 
+    let jio_programme_rows = programmes
+        .iter()
+        .filter(|programme| programme.provider.as_str() == "jio")
+        .count();
+
+    let zee5_programme_rows = programmes
+        .iter()
+        .filter(|programme| programme.provider.as_str() == "zee5")
+        .count();
+
     println!("📺 IPTV-org tvg-id channels : {}", iptv_channels.len());
     println!("📺 Jio source channels      : {}", jio_channels.len());
     println!("📺 Zee5 source channels     : {}", zee5_channels.len());
     println!("🧾 Programme rows available : {}", programmes.len());
+    println!("🧾 Jio programme rows       : {}", jio_programme_rows);
+    println!("🧾 Zee5 programme rows      : {}", zee5_programme_rows);
     println!("🔗 Direct Jio map rows      : {}", map_rows.len());
 
     if iptv_channels.is_empty() {
@@ -941,6 +978,7 @@ async fn run_full_build_pipeline(
             start_offset,
             end_offset,
             true,
+            ClearMode::Provider,
         )
         .await?;
 
@@ -950,6 +988,7 @@ async fn run_full_build_pipeline(
             database_url,
             epg_limit,
             true,
+            ClearMode::Provider,
         )
         .await?;
 
@@ -1194,12 +1233,17 @@ async fn run_zee5_epg_pipeline(
     database_url: &str,
     limit: Option<usize>,
     persist: bool,
+    clear_mode: ClearMode,
 ) -> anyhow::Result<()> {
     println!("🗓️ Starting Zee5 EPG pipeline");
 
     let pool = connect_and_migrate(database_url).await?;
     let provider_repo = ProviderChannelRepository::new(pool.clone());
     let programme_repo = ProgrammeRepository::new(pool);
+
+    if persist {
+        apply_programme_clear_mode(&programme_repo, "zee5", clear_mode).await?;
+    }
 
     let mut channels = provider_repo.list_by_provider("zee5").await?;
 
@@ -1247,6 +1291,30 @@ async fn run_zee5_epg_pipeline(
     if persist {
         println!("💾 Zee5 EPG programmes saved   : {}", saved_programmes);
         println!("✅ Database                    : {}", database_url);
+    }
+
+    Ok(())
+}
+
+async fn apply_programme_clear_mode(
+    repo: &ProgrammeRepository,
+    provider_kind: &str,
+    clear_mode: ClearMode,
+) -> anyhow::Result<()> {
+    match clear_mode {
+        ClearMode::Provider => {
+            println!("🧹 Clearing old {} programme rows", provider_kind);
+            repo.clear_by_provider(provider_kind).await?;
+        }
+
+        ClearMode::All => {
+            println!("🧹 Clearing all old programme rows");
+            repo.clear_all().await?;
+        }
+
+        ClearMode::None => {
+            println!("⏭️ Programme cleanup skipped");
+        }
     }
 
     Ok(())

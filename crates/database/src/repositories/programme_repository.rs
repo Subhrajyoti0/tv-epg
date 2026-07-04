@@ -80,6 +80,34 @@ impl ProgrammeRepository {
         Ok(row.0)
     }
 
+    pub async fn clear_all(&self) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM programmes")
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn clear_by_provider(&self, provider_kind: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM programmes WHERE provider_kind = ?")
+            .bind(provider_kind)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn count_by_provider(&self, provider_kind: &str) -> anyhow::Result<i64> {
+        let row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM programmes WHERE provider_kind = ?")
+                .bind(provider_kind)
+                .fetch_one(&self.pool)
+                .await?;
+
+        Ok(row.0)
+    }
+
+
     pub async fn list_all(&self) -> anyhow::Result<Vec<Programme>> {
         let rows = sqlx::query_as::<_, ProgrammeRow>(
             r#"
